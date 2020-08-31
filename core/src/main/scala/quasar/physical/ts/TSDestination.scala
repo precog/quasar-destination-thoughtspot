@@ -80,19 +80,19 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
       localTimeFormat = DateTimeFormatter.ofPattern(MimirTimePatterns.LocalTime))
 
   private[this] val tsSink: ResultSink[F, Type] =
-    ResultSink.create[F, Type](csvConfig) { (path, columns, bytes) =>
+    ResultSink.create[F, Type, Byte] { (path, columns) =>
       implicit val raiseClientErrorInResourceErr: FunctorRaise[F, Client.Error] =
-          new FunctorRaise[F, Client.Error] {
-            val functor = Functor[F]
-            def raise[A](err: Client.Error): F[A] = err match {
-              case Client.Error.Authentication =>
-                MonadResourceErr[F].raiseError[A](
-                  ResourceError.AccessDenied(
-                    path,
-                    Some(s"unable to authenticate with ssh server: user = ${config.user}"),
-                    None))
-            }
+        new FunctorRaise[F, Client.Error] {
+          val functor = Functor[F]
+          def raise[A](err: Client.Error): F[A] = err match {
+            case Client.Error.Authentication =>
+              MonadResourceErr[F].raiseError[A](
+                ResourceError.AccessDenied(
+                  path,
+                  Some(s"unable to authenticate with ssh server: user = ${config.user}"),
+                  None))
           }
+        }
 
       val tableNameF = path.uncons match {
         case Some((ResourceName(name), _)) =>
@@ -107,52 +107,56 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
               None))
       }
 
-      val r = for {
-        tableName <- Stream.eval[F, String](tableNameF)
+      val pipe: Pipe[F, Byte, Unit] = bytes => {
+        val r = for {
+          tableName <- Stream.eval[F, String](tableNameF)
 
-        _ <- Stream.eval(
+          _ <- Stream.eval(
+              Sync[F].delay(
+                log.info(s"(re)creating ${config.database}.${tableName} with schema ${columns.show}")))
+
+          p <- Stream.resource(client.exec(cc, "tql", blocker))
+          _ <- Stream(overwriteDdl(tableName, columns) + "exit;")
+            .flatMap(s => Stream.emits(s.getBytes("UTF-8")))
+            .through(p.stdin)
+
+          cmd = loadCommand(tableName)
+          _ <- Stream.eval(
             Sync[F].delay(
-              log.info(s"(re)creating ${config.database}.${tableName} with schema ${columns.show}")))
+              log.info(s"running remote ingest: $cmd")))
 
-        p <- Stream.resource(client.exec(cc, "tql", blocker))
-        _ <- Stream(overwriteDdl(tableName, columns) + "exit;")
-          .flatMap(s => Stream.emits(s.getBytes("UTF-8")))
-          .through(p.stdin)
+          p <- Stream.resource(client.exec(cc, cmd, blocker))
 
-        cmd = loadCommand(tableName)
-        _ <- Stream.eval(
-          Sync[F].delay(
-            log.info(s"running remote ingest: $cmd")))
+          exitCode <- bytes
+            // .observe(in => text.utf8Decode(in).through(text.lines).through(fs2.Sink.showLinesStdOut))
+            .observe(chunkLogSink)
+            .through(gzip[F](BufferSize))
+            .through(p.stdin)
+            .concurrently(
+              p.stdout
+                .through(text.utf8Decode)
+                .through(text.lines)
+                .merge(
+                  p.stderr
+                    .through(text.utf8Decode)
+                    .through(text.lines))
+                .through(infoSink)).drain ++ Stream.eval(p.join)
 
-        p <- Stream.resource(client.exec(cc, cmd, blocker))
+          _ <- if (exitCode =!= 0)
+            Stream.eval(Sync[F].delay(log.warn(s"tsload exited with status $exitCode")) *>
+              Sync[F].raiseError(TSDestination.IngestFailure: Throwable))
+          else
+            Stream.eval(Sync[F].delay(log.info(s"tsload exited with status $exitCode")))
+        } yield ()
 
-        exitCode <- bytes
-          // .observe(in => text.utf8Decode(in).through(text.lines).through(fs2.Sink.showLinesStdOut))
-          .observe(chunkLogSink)
-          .through(gzip[F](BufferSize))
-          .through(p.stdin)
-          .concurrently(
-            p.stdout
-              .through(text.utf8Decode)
-              .through(text.lines)
-              .merge(
-                p.stderr
-                  .through(text.utf8Decode)
-                  .through(text.lines))
-              .through(infoSink)).drain ++ Stream.eval(p.join)
-
-        _ <- if (exitCode =!= 0)
-          Stream.eval(Sync[F].delay(log.warn(s"tsload exited with status $exitCode")) *>
-            Sync[F].raiseError(TSDestination.IngestFailure: Throwable))
-        else
-          Stream.eval(Sync[F].delay(log.info(s"tsload exited with status $exitCode")))
-      } yield ()
-
-      r handleErrorWith { t =>
-        Stream.eval(
-          Sync[F].delay(log.error("thoughtspot push produced unexpected error", t)) >>
-            Sync[F].raiseError(t))
+        r handleErrorWith { t =>
+          Stream.eval(
+            Sync[F].delay(log.error("thoughtspot push produced unexpected error", t)) >>
+              Sync[F].raiseError(t))
+        }
       }
+
+      (csvConfig, pipe)
     }
 
   private[this] def loadCommand(tableName: String): String =
