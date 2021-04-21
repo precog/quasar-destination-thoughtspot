@@ -1,5 +1,5 @@
 /*
- * Copyright 2014–2019 SlamData Inc.
+ * Copyright 2020 Precog Data
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,11 +22,10 @@ import argonaut.{Argonaut, Json}, Argonaut._
 
 import cats.effect.{ConcurrentEffect, ContextShift, Resource,   Timer}
 
-import eu.timepit.refined.auto._
-
-import quasar.connector.{DestinationModule, MonadResourceErr}
-import quasar.api.destination.{Destination, DestinationError, DestinationType}, DestinationError.InitializationError
+import quasar.api.destination.{DestinationError, DestinationType}, DestinationError.InitializationError
 import quasar.api.destination.DestinationError.InitializationError
+import quasar.connector.MonadResourceErr
+import quasar.connector.destination.{Destination, DestinationModule, PushmiPullyu}
 
 import scala.util.Either
 
@@ -38,7 +37,8 @@ object TSDestinationModule extends DestinationModule {
     config.as[TSConfig].map(_.sanitized.asJson).getOr(jEmptyObject)
 
   def destination[F[_]: ConcurrentEffect: ContextShift: MonadResourceErr: Timer](
-      config: Json)
+      config: Json,
+      pushPull: PushmiPullyu[F])
       : Resource[F, Either[InitializationError[Json], Destination[F]]] =
     config.as[TSConfig].fold(
       (msg, _) =>

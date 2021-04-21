@@ -1,5 +1,5 @@
 /*
- * Copyright 2014–2019 SlamData Inc.
+ * Copyright 2020 Precog Data
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,27 +17,27 @@
 package quasar.physical.ts
 
 import cats.{Functor, Show}
+import cats.data.NonEmptyList
 import cats.effect.{Blocker, Concurrent, ContextShift, Resource, Sync}
 import cats.implicits._
 import cats.mtl.FunctorRaise
 
 import fs2.{text, Pipe, Stream}
-import fs2.compress.gzip
+import fs2.compression.gzip
 import fs2.io.ssh.{Auth => SshAuth, Client, ConnectionConfig}
 
 import org.slf4s.Logging
 
-import quasar.api.destination.{Destination, DestinationError, ResultSink}, DestinationError.InitializationError
-import quasar.api.push.RenderConfig
+import quasar.api.{Column, ColumnType}
+import quasar.api.destination.DestinationError.InitializationError
 import quasar.api.resource.ResourceName
-import quasar.api.table.{ColumnType, TableColumn}
 import quasar.connector.{MonadResourceErr, ResourceError}
-
-import scalaz.NonEmptyList
+import quasar.connector.destination.{Destination, LegacyDestination, ResultSink}
+import quasar.connector.render.RenderConfig
 
 import shims._
 
-import scala.{Byte, List, None, Predef, Some, StringContext, Unit}, Predef._
+import scala.{Byte, None, Predef, Some, StringContext, Unit}, Predef._
 import scala.util.Either
 
 import java.lang.{RuntimeException, String, Throwable}
@@ -49,7 +49,7 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
     config: TSConfig,
     client: Client[F],
     blocker: Blocker)
-    extends Destination[F]
+    extends LegacyDestination[F]
     with Logging {
 
   private val NullSentinel = "__sd_null_sentinel_str__"
@@ -66,8 +66,8 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
 
   def destinationType = TSDestinationModule.destinationType
 
-  def sinks: NonEmptyList[ResultSink[F]] =
-    NonEmptyList(tsSink)
+  def sinks: NonEmptyList[ResultSink[F, Type]] =
+    NonEmptyList.one(tsSink)
 
   private[this] val csvConfig =
     RenderConfig.Csv(
@@ -79,20 +79,20 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
       localDateFormat = DateTimeFormatter.ofPattern(MimirTimePatterns.LocalDate),
       localTimeFormat = DateTimeFormatter.ofPattern(MimirTimePatterns.LocalTime))
 
-  private[this] val tsSink: ResultSink[F] =
-    ResultSink.csv[F](csvConfig) { (path, columns, bytes) =>
+  private[this] val tsSink: ResultSink[F, Type] =
+    ResultSink.create[F, Type, Byte] { (path, columns) =>
       implicit val raiseClientErrorInResourceErr: FunctorRaise[F, Client.Error] =
-          new FunctorRaise[F, Client.Error] {
-            val functor = Functor[F]
-            def raise[A](err: Client.Error): F[A] = err match {
-              case Client.Error.Authentication =>
-                MonadResourceErr[F].raiseError[A](
-                  ResourceError.AccessDenied(
-                    path,
-                    Some(s"unable to authenticate with ssh server: user = ${config.user}"),
-                    None))
-            }
+        new FunctorRaise[F, Client.Error] {
+          val functor = Functor[F]
+          def raise[A](err: Client.Error): F[A] = err match {
+            case Client.Error.Authentication =>
+              MonadResourceErr[F].raiseError[A](
+                ResourceError.AccessDenied(
+                  path,
+                  Some(s"unable to authenticate with ssh server: user = ${config.user}"),
+                  None))
           }
+        }
 
       val tableNameF = path.uncons match {
         case Some((ResourceName(name), _)) =>
@@ -107,52 +107,56 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
               None))
       }
 
-      val r = for {
-        tableName <- Stream.eval[F, String](tableNameF)
+      val pipe: Pipe[F, Byte, Unit] = bytes => {
+        val r = for {
+          tableName <- Stream.eval[F, String](tableNameF)
 
-        _ <- Stream.eval(
+          _ <- Stream.eval(
+              Sync[F].delay(
+                log.info(s"(re)creating ${config.database}.${tableName} with schema ${columns.show}")))
+
+          p <- Stream.resource(client.exec(cc, "tql", blocker))
+          _ <- Stream(overwriteDdl(tableName, columns) + "exit;")
+            .flatMap(s => Stream.emits(s.getBytes("UTF-8")))
+            .through(p.stdin)
+
+          cmd = loadCommand(tableName)
+          _ <- Stream.eval(
             Sync[F].delay(
-              log.info(s"(re)creating ${config.database}.${tableName} with schema ${columns.show}")))
+              log.info(s"running remote ingest: $cmd")))
 
-        p <- Stream.resource(client.exec(cc, "tql", blocker))
-        _ <- Stream(overwriteDdl(tableName, columns) + "exit;")
-          .flatMap(s => Stream.emits(s.getBytes("UTF-8")))
-          .through(p.stdin)
+          p <- Stream.resource(client.exec(cc, cmd, blocker))
 
-        cmd = loadCommand(tableName)
-        _ <- Stream.eval(
-          Sync[F].delay(
-            log.info(s"running remote ingest: $cmd")))
+          exitCode <- bytes
+            // .observe(in => text.utf8Decode(in).through(text.lines).through(fs2.Sink.showLinesStdOut))
+            .observe(chunkLogSink)
+            .through(gzip[F](BufferSize))
+            .through(p.stdin)
+            .concurrently(
+              p.stdout
+                .through(text.utf8Decode)
+                .through(text.lines)
+                .merge(
+                  p.stderr
+                    .through(text.utf8Decode)
+                    .through(text.lines))
+                .through(infoSink)).drain ++ Stream.eval(p.join)
 
-        p <- Stream.resource(client.exec(cc, cmd, blocker))
+          _ <- if (exitCode =!= 0)
+            Stream.eval(Sync[F].delay(log.warn(s"tsload exited with status $exitCode")) *>
+              Sync[F].raiseError(TSDestination.IngestFailure: Throwable))
+          else
+            Stream.eval(Sync[F].delay(log.info(s"tsload exited with status $exitCode")))
+        } yield ()
 
-        exitCode <- bytes
-          // .observe(in => text.utf8Decode(in).through(text.lines).through(fs2.Sink.showLinesStdOut))
-          .observe(chunkLogSink)
-          .through(gzip[F](BufferSize))
-          .through(p.stdin)
-          .concurrently(
-            p.stdout
-              .through(text.utf8Decode)
-              .through(text.lines)
-              .merge(
-                p.stderr
-                  .through(text.utf8Decode)
-                  .through(text.lines))
-              .through(infoSink)).drain ++ Stream.eval(p.join)
-
-        _ <- if (exitCode =!= 0)
-          Stream.eval(Sync[F].delay(log.warn(s"tsload exited with status $exitCode")) *>
-            Sync[F].raiseError(TSDestination.IngestFailure: Throwable))
-        else
-          Stream.eval(Sync[F].delay(log.info(s"tsload exited with status $exitCode")))
-      } yield ()
-
-      r handleErrorWith { t =>
-        Stream.eval(
-          Sync[F].delay(log.error("thoughtspot push produced unexpected error", t)) >>
-            Sync[F].raiseError(t))
+        r handleErrorWith { t =>
+          Stream.eval(
+            Sync[F].delay(log.error("thoughtspot push produced unexpected error", t)) >>
+              Sync[F].raiseError(t))
+        }
       }
+
+      (csvConfig, pipe)
     }
 
   private[this] def loadCommand(tableName: String): String =
@@ -173,11 +177,11 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
     |   --boolean_representation 'true_false'""".stripMargin.replace("\n", "")
 
   // TODO partitioning
-  private[this] def overwriteDdl(tableName: String, columns: List[TableColumn]): String = {
-    def renderColumn(col: TableColumn): String = {
+  private[this] def overwriteDdl(tableName: String, columns: NonEmptyList[Column[ColumnType.Scalar]]): String = {
+    def renderColumn(col: Column[ColumnType.Scalar]): String = {
       import ColumnType.{String => _, _}
 
-      val TableColumn(name, tpe) = col
+      val Column(name, tpe) = col
 
       val tpeStr = tpe match {
         case Boolean | Null => "BOOL"
@@ -195,7 +199,7 @@ final class TSDestination[F[_]: Concurrent: ContextShift: MonadResourceErr] priv
       s""""${name}" $tpeStr"""
     }
 
-    val colsStr = columns.map(renderColumn).mkString("(", ",", ")")
+    val colsStr = columns.map(renderColumn).toList.mkString("(", ",", ")")
 
     s"""USE "${config.database}";
       | ${config.schema.map(s => s"""CREATE SCHEMA "$s";""")};
