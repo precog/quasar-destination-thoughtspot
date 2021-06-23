@@ -237,7 +237,7 @@ object TSDestination {
       : Resource[F, Either[InitializationError[C], Destination[F]]] =
     for {
       blocker <- Blocker[F]
-      isa <- Resource.liftF(Client.resolve[F](config.host, config.port, blocker))
+      isa <- Resource.eval(Client.resolve[F](config.host, config.port, blocker))
       client <- Client[F]
     } yield new TSDestination[F](isa, config, client, blocker).asRight[InitializationError[C]]
 
